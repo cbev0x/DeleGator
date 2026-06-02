@@ -382,7 +382,7 @@ DeleGator was developed and tested against a purpose-built Active Directory lab:
 
 Detection stack: Elasticsearch 8.x, Kibana, Logstash, Winlogbeat, Sysmon (Olaf Hartong config), extended audit policies across all machines.
 
-Full lab documentation: [Lab Environment Writeup](docs/lab-environment.md)
+Full lab documentation: [Lab Environment Writeup](https://cbev0x.github.io/posts/DeleGator/)
 
 ---
 
