@@ -310,7 +310,8 @@ class LDAPConnection:
         """
         search_filter = (
             "(&"
-            "(|(objectCategory=user)(objectCategory=computer))"
+            "(|(objectCategory=user)(objectCategory=computer)"
+            "(objectClass=msDS-GroupManagedServiceAccount))"
             "(msDS-AllowedToDelegateTo=*)"
             ")"
         )
@@ -343,7 +344,8 @@ class LDAPConnection:
         """
         search_filter = (
             "(&"
-            "(|(objectCategory=user)(objectCategory=computer))"
+            "(|(objectCategory=user)(objectCategory=computer)"
+            "(objectClass=msDS-GroupManagedServiceAccount))"
             "(msDS-AllowedToDelegateTo=*)"
             "(userAccountControl:1.2.840.113556.1.4.803:=16777216)"
             ")"
