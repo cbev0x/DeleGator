@@ -682,9 +682,11 @@ def _is_privileged_sid(sid: str) -> bool:
     }
     # Well-known built-in SIDs
     privileged_sids = {
-        "S-1-5-18",    # SYSTEM
+        "S-1-5-18",     # SYSTEM
         "S-1-5-32-544", # BUILTIN\Administrators
-        "S-1-3-0",     # Creator Owner
+        "S-1-3-0",      # Creator Owner
+        # Note: S-1-5-11 (Authenticated Users) is intentionally NOT here
+        # — if Authenticated Users has write over a computer that IS exploitable
     }
 
     if sid in privileged_sids:
