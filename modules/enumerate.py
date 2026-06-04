@@ -77,6 +77,7 @@ class EnumConfig:
     slow:            bool = False
     search_base:     Optional[str] = None
     output_dir:      str = "/tmp"
+    use_ssl:         bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -213,6 +214,7 @@ def _parse_security_descriptor(sd_bytes: bytes) -> list[str]:
         0x10000000 |  # GenericAll
         0x00000004    # GenericWrite
     )
+    FULL_CONTROL = {0x000f01ff, 0x000f01bd, 0x001f01ff}
 
     if not sd_bytes or len(sd_bytes) < 20:
         return []
@@ -244,7 +246,7 @@ def _parse_security_descriptor(sd_bytes: bytes) -> list[str]:
                 # ACCESS_ALLOWED_ACE: header(4) + mask(4) + SID
                 access_mask = struct.unpack_from("<I", sd_bytes, pos + 4)[0]
 
-                if access_mask & WRITE_FLAGS:
+                if (access_mask & WRITE_FLAGS) or (access_mask in FULL_CONTROL):
                     # Parse the SID starting at pos + 8
                     sid_str = _parse_sid(sd_bytes, pos + 8)
                     if sid_str:
@@ -737,6 +739,7 @@ def run_enumeration(
             dc_ip=config.dc_ip,
             domain=config.domain,
             opsec=ldap_opsec,
+            use_ssl=config.use_ssl,
         )
     except SystemExit:
         raise

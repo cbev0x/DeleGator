@@ -362,13 +362,15 @@ class LDAPConnection:
         write permissions that could be used to configure RBCD.
 
         Uses the LDAP_SERVER_SD_FLAGS_OID control to request
-        nTSecurityDescriptor — without this control Windows silently
-        omits the attribute even when the account has read access.
-
-        Searches the full domain base rather than just CN=Computers
-        to catch machines in custom OUs (common in real environments).
+        nTSecurityDescriptor. Searches full domain including
+        CN=Managed Service Accounts to catch gMSA objects.
         """
-        search_filter = "(objectCategory=computer)"
+        search_filter = (
+            "(|"
+            "(objectCategory=computer)"
+            "(objectClass=msDS-GroupManagedServiceAccount)"
+            ")"
+        )
         return self._query(
             search_filter,
             ACL_ATTRS + ["sAMAccountName", "distinguishedName"],
@@ -418,9 +420,8 @@ class LDAPConnection:
 
     def get_account_sid_and_groups(self, samname: str) -> tuple[Optional[str], list[str]]:
         """
-        Return (objectSid, [group_dns]) for an account.
-        Used by the RBCD enumeration to check both direct SID
-        matches and group membership when parsing ACLs.
+        Return (objectSid, [group_dns]) for an account including
+        built-in group memberships not stored in memberOf attribute.
         """
         results = self._query(
             f"(sAMAccountName={samname})",
@@ -434,13 +435,28 @@ class LDAPConnection:
         if not results:
             return None, []
 
-        entry    = results[0]
-        sid      = str(entry.get("objectSid")) if entry.get("objectSid") else None
+        entry     = results[0]
+        sid       = str(entry.get("objectSid")) if entry.get("objectSid") else None
+        dn        = entry.get("distinguishedName") or entry.get("dn", "")
         member_of = entry.get("memberOf") or []
         if isinstance(member_of, str):
             member_of = [member_of]
+        member_of = list(member_of or [])
 
-        return sid, list(member_of or [])
+        # Also query which groups this account is a member of directly
+        # This catches built-in groups (Account Operators, etc.) that
+        # don't appear in the memberOf attribute on the user object
+        if dn:
+            group_results = self._query(
+                f"(&(objectClass=group)(member={dn}))",
+                ["distinguishedName", "objectSid"],
+            )
+            for g in (group_results or []):
+                g_dn = g.get("distinguishedName") or g.get("dn", "")
+                if g_dn and g_dn not in member_of:
+                    member_of.append(g_dn)
+
+        return sid, member_of
 
     def get_account_by_samname(self, samname: str) -> Optional[dict]:
         """
@@ -691,6 +707,10 @@ def connect(
             os.environ["KRB5CCNAME"] = auth.ccache_path
 
         try:
+            # Try plain Kerberos first, fall back to TLS-before-bind
+            # for environments that enforce strongerAuthRequired (LDAP signing)
+            # When use_ssl=True, TLS is handled at transport layer (port 636)
+            # so the bind itself uses AUTO_BIND_NO_TLS — TLS is already active
             conn = Connection(
                 server,
                 user=auth.upn,
@@ -698,6 +718,13 @@ def connect(
                 sasl_mechanism=KERBEROS,
                 auto_bind=AUTO_BIND_NO_TLS,
             )
+            if not conn.bind():
+                result = conn.result.get("description", "unknown")
+                _die(
+                    f"Kerberos LDAP bind failed for '{auth.upn}': {result}\n"
+                    "  Ensure the ticket is valid and has not expired.\n"
+                    "  Try: klist to inspect the current ccache."
+                )
             if not conn.bind():
                 result = conn.result.get("description", "unknown")
                 _die(

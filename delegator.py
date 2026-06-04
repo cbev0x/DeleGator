@@ -244,6 +244,7 @@ def handle_enum(args) -> None:
         slow=args.slow,
         search_base=args.search_base,
         output_dir=args.out,
+        use_ssl=args.use_ssl,
     )
 
     run_enumeration(auth, config)
