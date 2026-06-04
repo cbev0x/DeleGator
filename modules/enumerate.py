@@ -557,30 +557,54 @@ def enumerate_rbcd_paths(
     """
     Enumerate RBCD write paths available to the current user.
 
-    Queries computer objects with nTSecurityDescriptor, parses the
-    binary ACL to find write permissions, then cross-references with
-    the current user's SID to identify directly exploitable paths.
+    Queries computer objects with nTSecurityDescriptor using the
+    LDAP SD control, parses ACLs, and checks both direct SID matches
+    and inherited group membership — catching permissions granted
+    via group membership rather than direct ACEs.
 
-    This is the most query-intensive enumeration step since it
-    pulls security descriptors for all computer objects in the
-    target OU. Scoping with --search-base significantly reduces noise.
+    Searches the full domain base to catch machines in custom OUs.
     """
     if not opsec.check("ldap_enum_targeted"):
         return []
 
     info("Querying computer object ACLs for RBCD write paths...")
-    info("(This query is more expensive — use --search-base to scope if needed)")
+    info("(Searching full domain — use --search-base to scope if needed)")
 
-    # Get current user's SID for direct write check
-    current_sid = ldap_conn.get_account_sid(auth.username)
+    # Resolve current user's SID and all group memberships
+    current_sid, group_dns = ldap_conn.get_account_sid_and_groups(auth.username)
     if not current_sid:
         warning(f"Could not resolve SID for '{auth.username}' — write path check limited")
+
+    # Build a flat set of all SIDs we should treat as "current user"
+    # This includes direct SID + all group SIDs the user is member of
+    user_sids: set[str] = set()
+    if current_sid:
+        user_sids.add(current_sid)
+
+    # Resolve group SIDs recursively
+    if group_dns:
+        info(f"Resolving {len(group_dns)} group membership(s) for write path check...")
+        for group_dn in group_dns:
+            # Get the group's own SID
+            group_results = ldap_conn._query(
+                f"(distinguishedName={group_dn})",
+                ["objectSid", "sAMAccountName"],
+            )
+            if group_results and group_results[0].get("objectSid"):
+                user_sids.add(str(group_results[0]["objectSid"]))
+            # Also recursively get all member SIDs of this group
+            member_sids = ldap_conn.get_group_members_recursive(group_dn)
+            user_sids.update(member_sids)
 
     # Get all computer objects with security descriptors
     computers = ldap_conn.get_computers_writable_by(current_sid or "")
 
     if not computers:
+        info("No computer objects returned — check permissions allow SD reads")
         return []
+
+    sd_count = sum(1 for c in computers if c.get("nTSecurityDescriptor"))
+    info(f"Retrieved {len(computers)} computer objects, {sd_count} with security descriptors")
 
     rbcd_paths = []
 
@@ -591,7 +615,6 @@ def enumerate_rbcd_paths(
         if not sd_raw:
             continue
 
-        # Parse the binary security descriptor
         if isinstance(sd_raw, bytes):
             writer_sids = _parse_security_descriptor(sd_raw)
         else:
@@ -601,19 +624,15 @@ def enumerate_rbcd_paths(
             continue
 
         for sid in writer_sids:
-            # Check if it's the current user
-            current_user_writable = (
-                current_sid and sid == current_sid
-            )
-
-            # Try to resolve SID to account name
-            samname_writer = _sid_to_samname(sid, ldap_conn)
-            display_writer = samname_writer or sid
-
-            # Skip well-known privileged SIDs that are expected to have write
-            # (Domain Admins, Enterprise Admins, SYSTEM, etc.)
             if _is_privileged_sid(sid):
                 continue
+
+            # Check if this SID matches the current user directly
+            # OR matches any group the user is a member of
+            current_user_writable = sid in user_sids
+
+            samname_writer = _sid_to_samname(sid, ldap_conn)
+            display_writer = samname_writer or sid
 
             rbcd_paths.append({
                 "sAMAccountName":           samname,
@@ -625,6 +644,15 @@ def enumerate_rbcd_paths(
                     "CRITICAL" if current_user_writable else "HIGH"
                 ),
             })
+
+    # Deduplicate by computer — if multiple ACEs make it writable
+    # keep only the highest risk one per target
+    seen = {}
+    for path in rbcd_paths:
+        key = path["sAMAccountName"]
+        if key not in seen or path["_current_user_writable"]:
+            seen[key] = path
+    rbcd_paths = list(seen.values())
 
     if rbcd_paths:
         direct = sum(1 for p in rbcd_paths if p.get("_current_user_writable"))

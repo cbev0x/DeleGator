@@ -31,6 +31,7 @@ import ssl
 from typing import Optional, Generator, Any
 
 import ldap3
+import struct
 from ldap3 import (
     Server, Connection, NTLM, KERBEROS, SASL,
     SUBTREE, ALL_ATTRIBUTES, SIMPLE, AUTO_BIND_NO_TLS,
@@ -181,6 +182,7 @@ class LDAPConnection:
         attributes:    list[str],
         search_base:   Optional[str] = None,
         scope:         Any           = SUBTREE,
+        use_sd_control: bool         = False,
     ) -> list[dict]:
         """
         Execute a single LDAP query and return a list of entry dicts.
@@ -189,10 +191,24 @@ class LDAPConnection:
         search_base or falls back to the domain root base_dn.
         Exits cleanly on LDAP errors rather than throwing exceptions
         up to the caller.
+
+        use_sd_control: when True, adds the LDAP_SERVER_SD_FLAGS_OID
+        control to request nTSecurityDescriptor in the response.
+        Required for reading security descriptors on AD objects.
+        Without this control Windows silently omits the attribute.
         """
         self.opsec.sleep()
 
-        base = search_base or self.base_dn
+        base     = search_base or self.base_dn
+        controls = None
+
+        if use_sd_control:
+            # LDAP_SERVER_SD_FLAGS_OID = 1.2.840.113556.1.4.801
+            # Request DACL_SECURITY_INFORMATION (0x04) only — sufficient
+            # for reading write permissions without triggering SACL access
+            # BER encoding of INTEGER value 4: 30 03 02 01 04
+            sd_flags_value = bytes([0x30, 0x03, 0x02, 0x01, 0x04])
+            controls = [("1.2.840.113556.1.4.801", True, sd_flags_value)]
 
         try:
             self._conn.search(
@@ -200,6 +216,7 @@ class LDAPConnection:
                 search_filter=search_filter,
                 search_scope=scope,
                 attributes=attributes,
+                controls=controls,
             )
         except LDAPOperationResult as e:
             _die(f"LDAP query failed: {e}")
@@ -342,21 +359,86 @@ class LDAPConnection:
         Find computer objects where the specified account SID has
         write permissions that could be used to configure RBCD.
 
-        This query pulls nTSecurityDescriptor which requires the
-        account to have read access to ACLs. The descriptor is
-        parsed by the enumeration module to find GenericWrite,
-        WriteDacl, and WriteOwner permissions.
+        Uses the LDAP_SERVER_SD_FLAGS_OID control to request
+        nTSecurityDescriptor — without this control Windows silently
+        omits the attribute even when the account has read access.
 
-        Note: This is a more expensive query than the delegation
-        attribute queries and generates more LDAP traffic. It is
-        only invoked when --check-rbcd-paths is specified.
+        Searches the full domain base rather than just CN=Computers
+        to catch machines in custom OUs (common in real environments).
         """
         search_filter = "(objectCategory=computer)"
         return self._query(
             search_filter,
             ACL_ATTRS + ["sAMAccountName", "distinguishedName"],
-            search_base=f"CN=Computers,{self.base_dn}",
+            search_base=self.base_dn,
+            use_sd_control=True,
         )
+
+    def get_group_members_recursive(self, group_dn: str) -> list[str]:
+        """
+        Recursively resolve all member SIDs of a group including
+        nested group membership. Returns a flat list of SID strings.
+        Used for RBCD write path detection where permissions are
+        granted to a group rather than directly to the user account.
+        """
+        seen_dns  = set()
+        all_sids  = []
+
+        def _resolve(dn: str) -> None:
+            if dn in seen_dns:
+                return
+            seen_dns.add(dn)
+
+            results = self._query(
+                f"(distinguishedName={dn})",
+                ["member", "objectSid", "objectClass"],
+            )
+            if not results:
+                return
+
+            entry      = results[0]
+            obj_class  = str(entry.get("objectClass", "")).lower()
+            obj_sid    = entry.get("objectSid")
+
+            # If this is a user/computer, collect its SID
+            if obj_sid and "group" not in obj_class:
+                all_sids.append(str(obj_sid))
+
+            # Recurse into members
+            members = entry.get("member") or []
+            if isinstance(members, str):
+                members = [members]
+            for member_dn in (members or []):
+                _resolve(str(member_dn))
+
+        _resolve(group_dn)
+        return all_sids
+
+    def get_account_sid_and_groups(self, samname: str) -> tuple[Optional[str], list[str]]:
+        """
+        Return (objectSid, [group_dns]) for an account.
+        Used by the RBCD enumeration to check both direct SID
+        matches and group membership when parsing ACLs.
+        """
+        results = self._query(
+            f"(sAMAccountName={samname})",
+            ["objectSid", "memberOf", "distinguishedName"],
+        )
+        if not results:
+            results = self._query(
+                f"(sAMAccountName={samname.rstrip('$') + '$'})",
+                ["objectSid", "memberOf", "distinguishedName"],
+            )
+        if not results:
+            return None, []
+
+        entry    = results[0]
+        sid      = str(entry.get("objectSid")) if entry.get("objectSid") else None
+        member_of = entry.get("memberOf") or []
+        if isinstance(member_of, str):
+            member_of = [member_of]
+
+        return sid, list(member_of or [])
 
     def get_account_by_samname(self, samname: str) -> Optional[dict]:
         """

