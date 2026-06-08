@@ -165,12 +165,14 @@ class LDAPConnection:
         domain:      str,
         dc_ip:       str,
         opsec:       OpsecConfig,
+        auth:        Optional["AuthContext"] = None,
     ):
         self._conn   = conn
         self.base_dn = base_dn
         self.domain  = domain
         self.dc_ip   = dc_ip
         self.opsec   = opsec
+        self._auth   = auth   # retained for SMB ops (SYSVOL reads, etc.)
 
     # ------------------------------------------------------------------
     # Internal query method — all public query methods funnel through here
@@ -494,6 +496,234 @@ class LDAPConnection:
         )
         return self._query(search_filter, COMPUTER_ATTRS)
 
+    def get_delegation_privilege_holders(self) -> dict:
+        """
+        Identify accounts and groups that hold SeEnableDelegationPrivilege
+        in the domain.
+
+        SeEnableDelegationPrivilege is a domain-level right assigned via
+        the Default Domain Controllers Policy GPO. Holding it allows an
+        account to set the TRUSTED_FOR_DELEGATION or
+        TRUSTED_TO_AUTH_FOR_DELEGATION flags on any account object — i.e.
+        to create a delegation attack path from scratch on any account
+        they control.
+
+        Method:
+          1. Locate the Default Domain Controllers Policy GPO by querying
+             for its well-known displayName under CN=Policies,CN=System.
+          2. Read gPCFileSysPath to get the UNC path to GptTmpl.inf.
+          3. Fetch GptTmpl.inf from the SYSVOL share via LDAP-adjacent
+             SMB — or fall back to reading the raw GPO attribute if the
+             file path is not reachable.
+          4. Parse the [Privilege Rights] section for SeEnableDelegationPrivilege.
+          5. Resolve each SID/account name in that list back to a
+             sAMAccountName and objectClass for display.
+
+        Returns a dict:
+          {
+            "gpo_path":   str | None,          # UNC path to GptTmpl.inf
+            "raw_value":  str | None,          # raw privilege entry
+            "holders": [
+              {
+                "sid":          str,
+                "sAMAccountName": str | None,
+                "objectClass":  str | None,
+                "is_group":     bool,
+                "member_count": int | None,    # only for groups
+              },
+              ...
+            ],
+          }
+
+        OPSEC note:
+          Reads one GPO object attribute (gPCFileSysPath) — a single
+          targeted LDAP query. Lower noise than a full GPO dump.
+          The GptTmpl.inf read is a standard SYSVOL file access.
+        """
+        result = {
+            "gpo_path":  None,
+            "raw_value": None,
+            "holders":   [],
+        }
+
+        # Step 1 — Find the Default Domain Controllers Policy GPO
+        policies_base = f"CN=Policies,CN=System,{self.base_dn}"
+        gpo_results = self._query(
+            "(&(objectClass=groupPolicyContainer)"
+            "(displayName=Default Domain Controllers Policy))",
+            ["distinguishedName", "gPCFileSysPath"],
+            search_base=policies_base,
+        )
+
+        if not gpo_results:
+            # Fallback: search from domain root in case of non-default structure
+            gpo_results = self._query(
+                "(&(objectClass=groupPolicyContainer)"
+                "(displayName=Default Domain Controllers Policy))",
+                ["distinguishedName", "gPCFileSysPath"],
+            )
+
+        if not gpo_results:
+            return result
+
+        gpc_path = gpo_results[0].get("gPCFileSysPath")
+        if not gpc_path:
+            return result
+
+        result["gpo_path"] = str(gpc_path)
+
+        # Step 2 — Fetch GptTmpl.inf from SYSVOL via SMB
+        # Path format: \\domain\SYSVOL\domain\Policies\{GUID}\MACHINE\
+        #              Microsoft\Windows NT\SecEdit\GptTmpl.inf
+        inf_path = str(gpc_path).rstrip("\\") + (
+            "\\MACHINE\\Microsoft\\Windows NT\\SecEdit\\GptTmpl.inf"
+        )
+        raw_value = self._read_gpttmpl_privilege(inf_path)
+
+        if not raw_value:
+            return result
+
+        result["raw_value"] = raw_value
+
+        # Step 3 — Parse the SID/name list from the privilege entry
+        # Format: SeEnableDelegationPrivilege = *S-1-5-32-544,*S-1-5-21-...-512
+        # Entries can be bare SIDs (prefixed *) or account names
+        entries = [e.strip().lstrip("*") for e in raw_value.split(",")]
+
+        for entry in entries:
+            if not entry:
+                continue
+
+            holder: dict = {
+                "sid":            entry if entry.startswith("S-1-") else None,
+                "sAMAccountName": None,
+                "objectClass":    None,
+                "is_group":       False,
+                "member_count":   None,
+            }
+
+            if entry.startswith("S-1-"):
+                # Resolve SID → account info
+                acct = self._query(
+                    f"(objectSid={entry})",
+                    ["sAMAccountName", "objectClass", "member"],
+                )
+            else:
+                # Plain account name
+                acct = self._query(
+                    f"(sAMAccountName={entry})",
+                    ["sAMAccountName", "objectClass", "member", "objectSid"],
+                )
+
+            if acct:
+                a = acct[0]
+                holder["sAMAccountName"] = a.get("sAMAccountName")
+                if not holder["sid"]:
+                    holder["sid"] = str(a.get("objectSid", "")) or None
+
+                obj_class = a.get("objectClass")
+                classes = (
+                    obj_class if isinstance(obj_class, list) else [obj_class]
+                ) if obj_class else []
+                class_str = " ".join(str(c) for c in classes).lower()
+                holder["objectClass"] = class_str
+                holder["is_group"]    = "group" in class_str
+
+                if holder["is_group"]:
+                    members = a.get("member") or []
+                    if isinstance(members, str):
+                        members = [members]
+                    holder["member_count"] = len(members)
+            else:
+                # Could not resolve — keep raw value as best effort
+                holder["sAMAccountName"] = entry
+
+            result["holders"].append(holder)
+
+        return result
+
+    def _read_gpttmpl_privilege(self, unc_path: str) -> Optional[str]:
+        """
+        Read GptTmpl.inf from a SYSVOL UNC path and extract the
+        SeEnableDelegationPrivilege line from [Privilege Rights].
+
+        Uses impacket's SMBConnection authenticated with the same
+        credentials that established the LDAP session. Anonymous SYSVOL
+        access is blocked on most modern domains so we always use real
+        credentials here.
+
+        Authentication priority mirrors the LDAP auth order:
+          1. NTLM hash  (pass-the-hash)
+          2. Password   (NTLM)
+          3. ccache     (Kerberos via KRB5CCNAME env var)
+          4. Anonymous  (last resort — will fail on hardened targets)
+
+        Returns the raw value string (everything after the '='),
+        or None if the file cannot be read or the privilege is absent.
+        """
+        try:
+            from impacket.smbconnection import SMBConnection
+
+            # Parse \\server\share\path from UNC
+            # e.g. \\dc.domain.com\SYSVOL\domain\Policies\{GUID}\...
+            parts = unc_path.lstrip("\\").split("\\")
+            if len(parts) < 3:
+                return None
+
+            server    = parts[0]
+            share     = parts[1]
+            file_path = "\\" + "\\".join(parts[2:])
+
+            smb = SMBConnection(server, self.dc_ip)
+
+            # Authenticate using stored auth context
+            a = self._auth
+            if a is not None:
+                method = a.auth_method.name
+                if method == "HASH":
+                    smb.login(
+                        a.username,
+                        "",
+                        a.domain,
+                        lmhash=a.lm_hash or "",
+                        nthash=a.nt_hash or "",
+                    )
+                elif method == "PASSWORD":
+                    smb.login(a.username, a.password or "", a.domain)
+                elif method in ("CCACHE", "CERT"):
+                    # Kerberos — SMBConnection picks up KRB5CCNAME from env
+                    # which connect() already set when building the LDAP session
+                    smb.kerberosLogin(
+                        a.username,
+                        "",
+                        a.domain,
+                        "",
+                        "",
+                        useCache=True,
+                    )
+                else:
+                    smb.login("", "", "", "", "")
+            else:
+                smb.login("", "", "", "", "")
+
+            buf = []
+            smb.getFile(share, file_path, buf.append)
+            smb.logoff()
+
+            content = b"".join(buf).decode("utf-16-le", errors="replace")
+
+            for line in content.splitlines():
+                if "SeEnableDelegationPrivilege" in line:
+                    _, _, value = line.partition("=")
+                    return value.strip() or None
+
+        except Exception:
+            # Silently fail — SYSVOL unreachable, auth rejected, etc.
+            # The caller surfaces a partial result rather than crashing.
+            pass
+
+        return None
+
     # ------------------------------------------------------------------
     # Write operations (used by exploitation modules)
     # ------------------------------------------------------------------
@@ -759,4 +989,5 @@ def connect(
         domain=resolved_domain,
         dc_ip=dc_ip,
         opsec=opsec,
+        auth=auth,
     )

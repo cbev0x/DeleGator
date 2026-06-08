@@ -160,24 +160,59 @@ def _validate_target_spn(
     return False
 
 
-def _resolve_service_spn(account_info: dict, service_account: str) -> Optional[str]:
+def _is_gmsa(account_info: dict) -> bool:
+    """
+    Return True if the account is a Group Managed Service Account (gMSA).
+
+    gMSAs live under CN=Managed Service Accounts in the directory and have
+    objectClass msDS-GroupManagedServiceAccount. They frequently have no
+    servicePrincipalName registered even when constrained delegation is
+    configured on them, which is the normal pattern — not a misconfiguration.
+    """
+    dn = str(account_info.get("distinguishedName", ""))
+    if "CN=Managed Service Accounts" in dn:
+        return True
+
+    obj_class = account_info.get("objectClass")
+    if obj_class:
+        classes = obj_class if isinstance(obj_class, list) else [obj_class]
+        if any("groupmanagedserviceaccount" in str(c).lower() for c in classes):
+            return True
+
+    return False
+
+
+def _resolve_service_spn(
+    account_info:    dict,
+    service_account: str,
+    domain:          str,
+) -> tuple[Optional[str], bool]:
     """
     Resolve the SPN to use for S4U2Self from the service account's
     servicePrincipalName attribute.
 
-    Returns the first registered SPN, or constructs a default one
-    from the account name if none are registered.
+    For accounts with no registered SPN (most commonly gMSAs), synthesize
+    a host/ SPN from the account name and domain. The KDC accepts this for
+    S4U2Self because every managed service account and computer object has
+    an implicit HOST service class.
+
+    Returns:
+        (spn, synthesized) where synthesized=True means no SPN was found
+        in LDAP and the value was constructed as a fallback.
     """
     spns = account_info.get("servicePrincipalName")
 
     if spns:
         spn_list = spns if isinstance(spns, list) else [spns]
-        if spn_list:
-            return str(spn_list[0])
+        filtered = [s for s in spn_list if s]
+        if filtered:
+            return str(filtered[0]), False
 
-    # Fallback — construct a generic SPN
-    # This may not always be valid but covers simple configurations
-    return None
+    # No SPN registered — synthesize host/<name>.<domain>
+    # Strip the trailing $ from machine/gMSA account names.
+    clean_name = service_account.rstrip("$")
+    synthesized = f"host/{clean_name}.{domain}"
+    return synthesized, True
 
 
 # ---------------------------------------------------------------------------
@@ -421,19 +456,23 @@ def run_constrained(
 
     # Step 5 — Resolve service SPN for S4U2Self
     svc_spn = config.service_spn
+    synthesized_spn = False
     if not svc_spn:
-        svc_spn = _resolve_service_spn(account_info, config.service_account)
-
-    if not svc_spn and proto_trans:
-        error(
-            f"Cannot resolve SPN for service account '{config.service_account}'.\n"
-            "  The account must have a registered servicePrincipalName.\n"
-            "  Specify it manually with --service-spn <SPN>."
+        svc_spn, synthesized_spn = _resolve_service_spn(
+            account_info, config.service_account, config.domain
         )
-        ldap_conn.close()
-        return None
 
-    if svc_spn:
+    if synthesized_spn and proto_trans:
+        is_gmsa_account = _is_gmsa(account_info)
+        account_type    = "gMSA" if is_gmsa_account else "service account"
+        warning(
+            f"No servicePrincipalName registered on {account_type} "
+            f"'{config.service_account}'.\n"
+            f"  Synthesized S4U2Self SPN: {svc_spn}\n"
+            "  This is normal for gMSAs with constrained delegation configured.\n"
+            "  Override with --service-spn <SPN> if the KDC rejects this."
+        )
+    elif svc_spn:
         info(f"Service SPN      : {svc_spn}")
 
     ldap_conn.close()
